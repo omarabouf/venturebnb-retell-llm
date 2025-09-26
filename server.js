@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -8,6 +7,18 @@ import axios from 'axios';
 const app = express();
 app.use(morgan('tiny'));
 app.use(bodyParser.json());
+
+// --- CORS + preflight for dashboard tests (IMPORTANT) ---
+app.use((req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// Optional: GET on the same path for quick checks in a browser
+app.get('/retell-llm', (_, res) => res.json({ ok: true, hint: 'POST here with messages[]' }));
 
 // In-memory session store (swap for Redis in prod)
 const sessions = new Map();
@@ -121,9 +132,15 @@ app.post('/retell-llm', async (req, res) => {
     }
   }
 
+  // return multiple common keys (covers different parsers)
   res.json({
     response: reply,
-    end_call: endCall
+    reply: reply,
+    content: reply,
+    text: reply,
+    end_call: endCall,
+    hangup: endCall,
+    hang_up: endCall
   });
 });
 
