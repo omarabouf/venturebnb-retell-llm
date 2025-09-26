@@ -10,7 +10,7 @@ const app = express();
 app.use(morgan('tiny'));
 app.use(bodyParser.json());
 
-// CORS + preflight so dashboard tests don't get blocked
+// --- CORS + preflight for dashboard tests ---
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Headers', 'Content-Type');
@@ -19,16 +19,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// Healthchecks
+// --- Healthchecks ---
 app.get('/', (_, res) => res.send('Venturebnb Retell LLM up'));
 app.get('/retell-llm', (_, res) => res.json({ ok: true, hint: 'POST/WS here' }));
 
-// ---- In-memory session ----
+// --- In-memory session store (swap for Redis in prod) ---
 const sessions = new Map();
 function getSession(callId) {
   if (!sessions.has(callId)) {
     sessions.set(callId, {
-      stage: 'intro',  // intro -> compare -> offer -> pick_time -> confirm -> done
+      stage: 'intro',                // intro -> compare -> offer -> pick_time -> confirm -> done
       offerA: process.env.OFFER_SLOT_A || 'Tomorrow 2:00 PM',
       offerB: process.env.OFFER_SLOT_B || 'Thursday 10:00 AM',
       chosenSlot: null
@@ -36,7 +36,9 @@ function getSession(callId) {
   }
   return sessions.get(callId);
 }
+
 function lastUserText(transcript = []) {
+  // Accept several possible transcript shapes
   for (let i = transcript.length - 1; i >= 0; i--) {
     const u = transcript[i] || {};
     const who = (u.role || u.speaker || '').toLowerCase();
@@ -46,11 +48,11 @@ function lastUserText(transcript = []) {
   return '';
 }
 
-// ---- HTTP server + WebSocket upgrade ----
+// --- Create HTTP server + WebSocket upgrade ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-// Accept BOTH `/retell-llm` and `/retell-llm/<call_id>` (plus any query string)
+// Accept BOTH `/retell-llm` and `/retell-llm/<call_id>` plus queries
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname || '';
@@ -58,9 +60,13 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  // Try to extract callId from path or query
-  const pathParts = pathname.split('/').filter(Boolean); // e.g., ["retell-llm", "<id>"]
-  let callId = pathParts[1] || url.searchParams.get('call_id') || url.searchParams.get('id') || `call_${Date.now()}`;
+  const parts = pathname.split('/').filter(Boolean); // ["retell-llm", "<id>?"]
+  const callId =
+    parts[1] ||
+    url.searchParams.get('call_id') ||
+    url.searchParams.get('id') ||
+    `call_${Date.now()}`;
+
   console.log('[WS] upgrade', { pathname, callId });
 
   wss.handleUpgrade(req, socket, head, (ws) => {
@@ -69,31 +75,47 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
-// ---- Retell WebSocket protocol ----
+// --- Retell LLM WebSocket handling ---
 wss.on('connection', (ws) => {
   const callId = ws.callId;
   const session = getSession(callId);
   console.log('[WS] connected', callId);
 
-  // Send optional config
+  // Send optional config packet back to Retell
   ws.send(JSON.stringify({
     response_type: 'config',
     config: { auto_reconnect: false, call_details: false }
   }));
 
+  // Fallback greeting if Retell doesn't ask us to speak quickly
+  let alreadySpoke = false;
+  const greetIfSilent = setTimeout(() => {
+    if (alreadySpoke) return;
+    ws.send(JSON.stringify({
+      response_type: 'response',
+      content: `Hi, this is the Venturebnb concierge assistant. I’m an automated assistant following up about the profit analysis you requested for your Airbnb. Did you get the text we sent with your numbers?`,
+      end_call: false
+    }));
+    alreadySpoke = true;
+  }, 1500);
+
   ws.on('message', async (buf) => {
     let msg = null;
     try { msg = JSON.parse(buf.toString()); } catch { return; }
-    // Useful to see messages coming from Retell in Render logs:
+    // Helpful logs
     console.log('[WS] message', callId, msg.interaction_type || Object.keys(msg));
 
-    // Retell asks us to respond with interaction_type= response_required / reminder_required
+    // Retell will ask us to respond via these interaction types
     if (msg.interaction_type === 'response_required' || msg.interaction_type === 'reminder_required') {
+      // We're about to speak because Retell asked us to.
+      clearTimeout(greetIfSilent);
+      alreadySpoke = true;
+
       const user = lastUserText(msg.transcript);
       let reply = '';
       let endCall = false;
 
-      // If no user text yet, greet
+      // If we haven't greeted (no user text yet), start with greeting
       if (!user && session.stage === 'intro') {
         reply = `Hi, this is the Venturebnb concierge assistant. I’m an automated assistant following up about the profit analysis you requested for your Airbnb. Did you get the text we sent with your numbers?`;
         session.stage = 'intro_wait';
@@ -185,6 +207,7 @@ wss.on('connection', (ws) => {
   ws.on('error', (e) => console.log('[WS] error', callId, e?.message));
 });
 
-// start server
+// --- start server ---
 const port = process.env.PORT || 8080;
 server.listen(port, () => console.log(`Listening on :${port}`));
+
