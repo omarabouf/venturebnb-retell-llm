@@ -19,11 +19,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// Simple healthchecks
+// Healthchecks
 app.get('/', (_, res) => res.send('Venturebnb Retell LLM up'));
 app.get('/retell-llm', (_, res) => res.json({ ok: true, hint: 'POST/WS here' }));
 
-// ---- In-memory session (swap for Redis in prod) ----
+// ---- In-memory session ----
 const sessions = new Map();
 function getSession(callId) {
   if (!sessions.has(callId)) {
@@ -46,126 +46,132 @@ function lastUserText(transcript = []) {
   return '';
 }
 
-// ---- Create HTTP server + attach WebSocket upgrade ----
+// ---- HTTP server + WebSocket upgrade ----
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-// Expect path: /retell-llm/<call_id>
+// Accept BOTH `/retell-llm` and `/retell-llm/<call_id>` (plus any query string)
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const m = url.pathname.match(/^\/retell-llm\/(.+)$/);
-  if (!m) {
+  const pathname = url.pathname || '';
+  if (!pathname.startsWith('/retell-llm')) {
     socket.destroy();
     return;
   }
-  const callId = m[1];
+  // Try to extract callId from path or query
+  const pathParts = pathname.split('/').filter(Boolean); // e.g., ["retell-llm", "<id>"]
+  let callId = pathParts[1] || url.searchParams.get('call_id') || url.searchParams.get('id') || `call_${Date.now()}`;
+  console.log('[WS] upgrade', { pathname, callId });
+
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.callId = callId;
     wss.emit('connection', ws, req);
   });
 });
 
-// ---- WebSocket protocol per Retell docs ----
+// ---- Retell WebSocket protocol ----
 wss.on('connection', (ws) => {
   const callId = ws.callId;
   const session = getSession(callId);
+  console.log('[WS] connected', callId);
 
-  // 1) Optional config back to Retell
+  // Send optional config
   ws.send(JSON.stringify({
     response_type: 'config',
     config: { auto_reconnect: false, call_details: false }
   }));
 
-  // 2) Initial greeting (can be empty string to wait for user)
-  ws.send(JSON.stringify({
-    response_type: 'response',
-    content: `Hi, this is the Venturebnb concierge assistant. I’m an automated assistant following up about the profit analysis you requested for your Airbnb. Did you get the text we sent with your numbers?`,
-    end_call: false
-  }));
-
   ws.on('message', async (buf) => {
     let msg = null;
     try { msg = JSON.parse(buf.toString()); } catch { return; }
+    // Useful to see messages coming from Retell in Render logs:
+    console.log('[WS] message', callId, msg.interaction_type || Object.keys(msg));
 
-    // Retell will send response_required/reminder_required with full transcript
+    // Retell asks us to respond with interaction_type= response_required / reminder_required
     if (msg.interaction_type === 'response_required' || msg.interaction_type === 'reminder_required') {
       const user = lastUserText(msg.transcript);
       let reply = '';
       let endCall = false;
 
-      switch (session.stage) {
-        case 'intro':
-        case 'intro_wait': {
-          if (/\b(yes|yeah|yep|i did|got it)\b/.test(user)) {
-            reply = `Great! How did the numbers compare to what you’re currently seeing?`;
-            session.stage = 'compare';
-          } else if (/\b(no|not yet|didn’t|get|never)\b/.test(user)) {
-            reply = `No problem—I’ll make sure we resend that. In the meantime, I can walk you through the highlights quickly.`;
-            session.stage = 'compare';
-          } else {
-            reply = `Just to confirm—did you receive the profit analysis text?`;
-            session.stage = 'intro_wait';
-          }
-          break;
-        }
-        case 'compare': {
-          reply = `That makes sense. Most homeowners I speak with want a quick 15-minute call with our profit strategist to see how we typically boost revenue and reduce costs. Would you like me to set that up?`;
-          session.stage = 'offer';
-          break;
-        }
-        case 'offer': {
-          if (/\b(yes|sure|ok|okay|sounds good|let’s do it|lets do it|book)\b/.test(user)) {
-            reply = `Awesome. I have ${session.offerA} or ${session.offerB}. Which works better for you?`;
-            session.stage = 'pick_time';
-          } else if (/\b(no|not interested|pass|maybe later)\b/.test(user)) {
-            reply = `Got it—thanks for your time today. If it’s helpful, I can text you the analysis summary again. Have a great day!`;
-            session.stage = 'done';
-            endCall = true;
-          } else {
-            reply = `No worries—would mornings or afternoons generally work better for you?`;
-          }
-          break;
-        }
-        case 'pick_time': {
-          if (user.includes('tomorrow') || user.includes('2')) {
-            session.chosenSlot = session.offerA;
-          } else if (user.includes('thursday') || user.includes('10')) {
-            session.chosenSlot = session.offerB;
-          } else if (/\b(morning|afternoon|evening)\b/.test(user)) {
-            session.chosenSlot = /morning/.test(user) ? session.offerB : session.offerA;
-          }
-
-          if (!session.chosenSlot) {
-            reply = `I can do ${session.offerA} or ${session.offerB}. Which would you prefer?`;
+      // If no user text yet, greet
+      if (!user && session.stage === 'intro') {
+        reply = `Hi, this is the Venturebnb concierge assistant. I’m an automated assistant following up about the profit analysis you requested for your Airbnb. Did you get the text we sent with your numbers?`;
+        session.stage = 'intro_wait';
+      } else {
+        switch (session.stage) {
+          case 'intro':
+          case 'intro_wait': {
+            if (/\b(yes|yeah|yep|i did|got it)\b/.test(user)) {
+              reply = `Great! How did the numbers compare to what you’re currently seeing?`;
+              session.stage = 'compare';
+            } else if (/\b(no|not yet|didn’t|get|never)\b/.test(user)) {
+              reply = `No problem—I’ll make sure we resend that. In the meantime, I can walk you through the highlights quickly.`;
+              session.stage = 'compare';
+            } else {
+              reply = `Just to confirm—did you receive the profit analysis text?`;
+              session.stage = 'intro_wait';
+            }
             break;
           }
-
-          try {
-            if (process.env.BOOKING_WEBHOOK_URL) {
-              await axios.post(process.env.BOOKING_WEBHOOK_URL, {
-                call_id: callId,
-                slot: session.chosenSlot
-              }, { timeout: 8000 });
+          case 'compare': {
+            reply = `That makes sense. Most homeowners I speak with want a quick 15-minute call with our profit strategist to see how we typically boost revenue and reduce costs. Would you like me to set that up?`;
+            session.stage = 'offer';
+            break;
+          }
+          case 'offer': {
+            if (/\b(yes|sure|ok|okay|sounds good|let’s do it|lets do it|book)\b/.test(user)) {
+              reply = `Awesome. I have ${session.offerA} or ${session.offerB}. Which works better for you?`;
+              session.stage = 'pick_time';
+            } else if (/\b(no|not interested|pass|maybe later)\b/.test(user)) {
+              reply = `Got it—thanks for your time today. If it’s helpful, I can text you the analysis summary again. Have a great day!`;
+              session.stage = 'done';
+              endCall = true;
+            } else {
+              reply = `No worries—would mornings or afternoons generally work better for you?`;
             }
-          } catch { /* ignore for now */ }
+            break;
+          }
+          case 'pick_time': {
+            if (user.includes('tomorrow') || user.includes('2')) {
+              session.chosenSlot = session.offerA;
+            } else if (user.includes('thursday') || user.includes('10')) {
+              session.chosenSlot = session.offerB;
+            } else if (/\b(morning|afternoon|evening)\b/.test(user)) {
+              session.chosenSlot = /morning/.test(user) ? session.offerB : session.offerA;
+            }
 
-          reply = `Perfect—I’ve booked you for ${session.chosenSlot}. You’ll get a confirmation text and calendar invite shortly. Anything else I can help with?`;
-          session.stage = 'confirm';
-          break;
-        }
-        case 'confirm': {
-          reply = `Great—thanks again, and talk soon!`;
-          endCall = true;
-          session.stage = 'done';
-          break;
-        }
-        default: {
-          reply = `Thanks for your time today. Have a great day!`;
-          endCall = true;
+            if (!session.chosenSlot) {
+              reply = `I can do ${session.offerA} or ${session.offerB}. Which would you prefer?`;
+              break;
+            }
+
+            try {
+              if (process.env.BOOKING_WEBHOOK_URL) {
+                await axios.post(process.env.BOOKING_WEBHOOK_URL, {
+                  call_id: callId,
+                  slot: session.chosenSlot
+                }, { timeout: 8000 });
+              }
+            } catch { /* ignore for now */ }
+
+            reply = `Perfect—I’ve booked you for ${session.chosenSlot}. You’ll get a confirmation text and calendar invite shortly. Anything else I can help with?`;
+            session.stage = 'confirm';
+            break;
+          }
+          case 'confirm': {
+            reply = `Great—thanks again, and talk soon!`;
+            endCall = true;
+            session.stage = 'done';
+            break;
+          }
+          default: {
+            reply = `Thanks for your time today. Have a great day!`;
+            endCall = true;
+          }
         }
       }
 
-      // Send the response Retell will speak (attach response_id)
+      // Respond with the same response_id Retell provided
       ws.send(JSON.stringify({
         response_type: 'response',
         response_id: msg.response_id,
@@ -174,8 +180,11 @@ wss.on('connection', (ws) => {
       }));
     }
   });
+
+  ws.on('close', () => console.log('[WS] closed', callId));
+  ws.on('error', (e) => console.log('[WS] error', callId, e?.message));
 });
 
-// ---- start server ----
+// start server
 const port = process.env.PORT || 8080;
 server.listen(port, () => console.log(`Listening on :${port}`));
