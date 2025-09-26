@@ -23,6 +23,30 @@ app.use((req, res, next) => {
 app.get('/', (_, res) => res.send('Venturebnb Retell LLM up'));
 app.get('/retell-llm', (_, res) => res.json({ ok: true, hint: 'POST/WS here' }));
 
+// --- Simple HTTP fallback (some Retell tests use HTTP) ---
+app.post('/retell-llm', (req, res) => {
+  // Minimal, safe response that many parsers accept
+  const name =
+    req.body?.callee?.name ||
+    req.body?.lead_name ||
+    req.query?.name ||
+    '';
+  const reply =
+    `Hi ${name ? name + ', ' : ''}this is the Venturebnb concierge assistant. ` +
+    `I’m an automated assistant following up about the profit analysis you requested for your Airbnb. ` +
+    `Did you get the text we sent with your numbers?`;
+
+  res.json({
+    // several key names to satisfy different dash behaviors
+    response: reply,
+    reply: reply,
+    content: reply,
+    text: reply,
+    end_call: false,
+    hangup: false
+  });
+});
+
 // --- In-memory session store (swap for Redis in prod) ---
 const sessions = new Map();
 function getSession(callId) {
@@ -102,7 +126,6 @@ wss.on('connection', (ws) => {
   ws.on('message', async (buf) => {
     let msg = null;
     try { msg = JSON.parse(buf.toString()); } catch { return; }
-    // Helpful logs
     console.log('[WS] message', callId, msg.interaction_type || Object.keys(msg));
 
     // Retell will ask us to respond via these interaction types
@@ -115,7 +138,6 @@ wss.on('connection', (ws) => {
       let reply = '';
       let endCall = false;
 
-      // If we haven't greeted (no user text yet), start with greeting
       if (!user && session.stage === 'intro') {
         reply = `Hi, this is the Venturebnb concierge assistant. I’m an automated assistant following up about the profit analysis you requested for your Airbnb. Did you get the text we sent with your numbers?`;
         session.stage = 'intro_wait';
@@ -210,4 +232,3 @@ wss.on('connection', (ws) => {
 // --- start server ---
 const port = process.env.PORT || 8080;
 server.listen(port, () => console.log(`Listening on :${port}`));
-
